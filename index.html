@@ -863,8 +863,8 @@ const MARK='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPMAAADhCAYAAAAd6IOvAA
    в интерфейсе честно написано, что живые голоса Silero появятся на сервере компании. */
 const DEPLOY=true;
 const ENV={
-  apiBase:'',                          // напр. '/api' — наш прокси. Пусто → демо-режим
-  llm:{provider:'',model:'gemini-2.5-flash',timeoutMs:8000,endpoint:'',token:''},  // GEMINI_API_KEY — на сервере
+  apiBase:'https://dozvon-llm.hellnazenberg.workers.dev',                          // напр. '/api' — наш прокси. Пусто → демо-режим
+  llm:{provider:'',model:'gemini-3.5-flash',timeoutMs:10000,endpoint:'/llm/turn',token:'pesochnica'},  // GEMINI_API_KEY — на сервере
   tts:{endpoint:'',voice:'baya'},      // '/api/tts' → Silero (голос клиента)
   stt:{endpoint:''},                   // 'wss://dozvon.brinex.ru/api/stt' → Vosk
   rec:{endpoint:'',keepDays:30},       // '/api/recordings' → S3/Drive. Пусто → запись в браузере
@@ -965,7 +965,9 @@ function buildLLMPayload(s,text,c,turn){
     'Правила ответа: одна реплика, 1–3 предложения, живой разговорный русский, без канцелярита.',
     'Не соглашайся сразу, не подыгрывай менеджеру, не задавай вопросы вместо ответа на его вопрос.',
     'Не пиши пояснений, ремарок, имён и реплик за менеджера. Не выходи из роли, не упоминай, что ты ИИ.',
-    'Без кавычек, смайлов, списков, ссылок и форматирования — только сама реплика.',
+    'Без кавычек, смайлов, ссылок и форматирования — только сама реплика, одним абзацем.',
+    'Запрещено: списки, нумерация, маркеры, заголовки, пояснения в скобках и звёздочках.',
+    'Это телефонный разговор: никаких «1. Стабильность поставок» — только живая речь, как человек на связи.',
     turn&&turn.llm?('Опорная реплика по сценарию (можно перефразировать, смысл сохрани): '+turn.llm):''
   ].filter(Boolean).join('\n');
   return {
@@ -980,17 +982,36 @@ function buildLLMPayload(s,text,c,turn){
 /* Чистим ответ модели. Вернули строку — берём её; вернули null — работает сценарий. */
 function llmClean(t){
   if(!t||typeof t!=='string')return null;
+  /* Список вместо реплики (видели живьём: «1. Стабильность поставок. 2. …») —
+     это не речь человека на телефоне. Проверяем до схлопывания пробелов. */
+  const bullets=(t.match(/(^|\n)\s*(?:[-•*]|\d+[.)])\s+/g)||[]).length;
+  if(bullets>=2)return null;
   let x=t.trim()
     .replace(/^[\s"'`«»„“]+|[\s"'`«»„“]+$/g,'')     /* кавычки и пробелы по краям */
-    .replace(/^(Клиент|Клиентка|Ответ)\s*[:\-—]\s*/i,'')
-    .replace(/\*\*|__|`/g,'')                          /* обрывки разметки */
+    .replace(/\*\*|__|`/g,'')                          /* обрывки разметки — до ремарок, иначе «**Важно:**» не снимается */
+    .replace(/\([^)]*\)|\[[^\]]*\]|\*[^*]*\*/g,' ') /* ремарки в скобках и звёздочках */
+    .replace(/^(Клиент|Клиентка|Ответ|Реплика|Важно|Примечание|Пример)\s*[:\-—]\s*/i,'')
+    .replace(/^\s*(?:[-•*]|\d+[.)])\s+/,'')            /* если маркер всё же один — снимаем */
+    .replace(/^#{1,6}\s*/,'')                            /* заголовок */
     .replace(/\s+/g,' ')
-    .trim();
+    .trim()
+    .replace(/^[а-яё]/,m=>m.toUpperCase());              /* первая буква — заглавная */
   if(!x)return null;
   if(/https?:\/\//i.test(x))return null;                  /* ссылки в реплике не нужны */
-  if(!/[а-яё]/i.test(x))return null;                    /* не по-русски — берём сценарий */
   if(/(я искусственн|как ии|language model|openai|gemini|chatgpt)/i.test(x))return null;
+  /* Почти без русских букв — значит, модель написала не речь (бывало живьём) */
+  const all=x.match(/[a-zа-яё]/gi)||[], cyr=x.match(/[а-яё]/gi)||[];
+  if(!cyr.length||cyr.length/all.length<0.6)return null;
+  if(x.split(/\s+/).length<3)return null;                 /* обрывок, а не реплика */
   if(x.length>320)x=x.slice(0,320).replace(/\s+\S*$/,'')+'…';
+  /* Модель иногда не дописывает фразу (кончились токены): такой обрывок
+     давать в эфир нельзя — лучше сценарий. Если есть законченная часть,
+     берём её; если нет ни одного знака конца — отвергаем. */
+  if(!/[.!?…»"')\]]$/.test(x)){
+    const cut=Math.max(x.lastIndexOf('.'),x.lastIndexOf('!'),x.lastIndexOf('?'));
+    if(cut>60)x=x.slice(0,cut+1);
+    else if(x.length>60)return null;
+  }
   return x;
 }
 
@@ -4078,5 +4099,5 @@ render();
   });
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4d028d41d36dbb3',t:'MTc5MjQxNjg1OA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4d74e75b8fde7b9',t:'MTc5MjQ5MTc5OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
