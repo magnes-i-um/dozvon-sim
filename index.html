@@ -1982,6 +1982,9 @@ const RE={
   others:/другие тоже|у других так же|другие говорили|тоже так считали/,
   yesand:/да, и|и при этом|при этом/,
   nextStep:/в (понедельник|вторник|среду|четверг|пятницу|субботу)|завтра|послезавтра|пришлю|отправлю|созвонимся|зафиксиру|договоримся|назначим|запишу|подготовлю к|разбер[её]м/,
+  /* Прощание менеджера: раньше клиент на него не реагировал, и разговор
+     уходил на второй и третий круг. Теперь это сигнал завершить звонок. */
+  farewell:/до свидания|всего (доброго|хорошего|наилучшего)|всего вам|хорошего (дня|вечера)|приятного (дня|вечера)|удачного дня|до (встречи|связи|скорого|скорой)|будьте здоровы|спасибо за (время|удел[её]нное|беседу|разговор)/,
   concrete:/\d|процент|тысяч|млн|дней|часов|48|отсрочк|неустойк|sla|наличи|склад|резерв|выборк|брак|сезон|размерност|tco|стоимость владения|простой/,
   openQ:/^(как|что|чем|почему|зачем|какой|какие|сколько|когда|где|расскажите|опишите|уточните|поясните)(?![а-яё])/,  /* \b не работает после кириллицы */
   quickMark:null
@@ -2357,7 +2360,8 @@ function startCall(clientId){
     usedTexts:[],useless:0,   /* usedTexts — уже звучавшие реплики: повтор не начисляет баллы; useless — холостые фразы (не тот этап / повтор) */
     clientTyping:false,hintOpen:false,fallbackNotice:false,marked:false,micHint:'',
     /* ИИ: спросили / модель ответила / взяли сценарий. Ноль — норма, не ошибка. */
-    llmAsked:0,llmReplies:0,llmFallbacks:0,llmModel:''
+    llmAsked:0,llmReplies:0,llmFallbacks:0,llmModel:'',llmTokens:0,llmTokensIn:0,llmTokensOut:0,llmCached:0,
+    farewellStep:0,   /* 0 — разговор идёт · 1 — клиент попрощался · 2 — менеджер продолжил после прощания */
   };
   S.draft='';                       /* поле ввода всегда стартует пустым */
   S.screen='call';/* панель подсказки открывается сама только в десктопном виде: в режиме рамки она бы закрыла пульт */
@@ -2411,6 +2415,9 @@ function finalize(s){
     /* ИИ: сколько реплик клиента написала модель и сколько раз брали сценарий.
        Нужно, чтобы методист видел, звонок был живым или по сценарию. */
     llmReplies:s.llmReplies||0,llmFallbacks:s.llmFallbacks||0,llmAsked:s.llmAsked||0,llmModel:s.llmModel||'',
+    /* Расход по звонку: чтобы методист видел цену живого ИИ в токенах, а не на глаз */
+    llmTokens:s.llmTokens||0,llmTokensIn:s.llmTokensIn||0,llmTokensOut:s.llmTokensOut||0,llmCached:s.llmCached||0,
+    closedByClient:!!s.farewellStep,   /* разговор закрыл клиент, а не кнопка «Завершить» */
     date:new Date().toISOString(),failReason:s.failReason||'',linked:!!s.answerLinked
   };
   rec.score=score;rec.grade=gradeFor(rec);
@@ -2608,6 +2615,8 @@ function scrReview(){
         <span class="chip violet">${pl(rec.hints,'подсказка','подсказки','подсказок')}</span>
         <span class="chip slate">${pl(rec.raw.openQ+rec.raw.closedQ,'вопрос','вопроса','вопросов')}</span>
         ${methodistView()&&rec.llmAsked?`<span class="chip ${rec.llmReplies?'violet':'slate'}">${rec.llmReplies?'реплики клиента: ИИ '+rec.llmReplies:'реплики клиента: сценарий'}</span>`:''}
+        ${methodistView()&&rec.llmTokens?`<span class="chip slate">токенов: ${rec.llmTokens}${rec.llmCached?' · из кэша '+rec.llmCached:''}</span>`:''}
+        ${methodistView()&&rec.closedByClient?`<span class="chip mint">разговор закрыл клиент</span>`:''}
         ${methodistView()&&rec.llmFallbacks?`<span class="chip slate">переход на сценарий: ${rec.llmFallbacks}</span>`:''}
       </div>
       ${marks.length?`<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:10px">${marks.join('')}</div>`:''}
@@ -3259,9 +3268,9 @@ function sendReply(text,fromQuick,quickStage){
   s.turns.push({who:'you',txt:text.trim(),quick:!!fromQuick,interrupted});
   if(fromQuick)s.quickCount++;                     /* доля шаблонных реплик считается по всем нажатиям */
   s.managerTurns++;s.managerChars+=text.length;s.draft='';
-  /* ОС куратора: поле ввода очищается сразу после отправки */
-  S.draft='';
-  const inpEl=$('#say');if(inpEl)inpEl.value='';
+  /* ОС куратора: поле ввода очищается сразу после отправки. И голосовой
+     буфер тоже — иначе следующая фраза дописывалась к уже отправленной. */
+  micReset();
 
   /* --- Уместность реплики: закрываем фарм баллами одной и той же фразой -------------
      Баллы (критерии, настрой, продвижение этапа) начисляются, только если реплика:
@@ -3335,6 +3344,21 @@ function sendReply(text,fromQuick,quickStage){
   }
   const rep=clientReply(turn,c,s.mood,s.engine);
   if(rep.fb)s.fbTurns++;
+  /* --- КЛИЕНТ УМЕЕТ ПРОЩАТЬСЯ ----------------------------------------------
+     Было: клиент не реагировал на прощание и на зафиксированную договорённость,
+     поэтому менеджер уходил на второй и третий круг. Теперь:
+       · менеджер зафиксировал следующий шаг на этапе «Закрытие» — клиент
+         подтверждает договорённость и прощается;
+       · менеджер попрощался прямо — клиент прощается на любом этапе;
+       · после прощания у менеджера остаётся одна реплика: клиент вежливо
+         возвращает разговор к договорённости и закрывает его.
+     Завершает звонок клиент, поэтому менеджер учится фиксировать итог. */
+  const bye=RE.farewell.test(norm(text));
+  const deal=!!a.nextStep&&stageIdx(s)>=4;
+  let closing=0;
+  if(s.farewellStep===1)closing=2;              /* менеджер говорит после прощания */
+  else if(bye||deal)closing=1;                  /* пора закрывать разговор */
+  if(closing)s.farewellStep=closing;
 
   /* --- ТОЧКА ПОДКЛЮЧЕНИЯ LLM ------------------------------------------------
      Запрос уходит сразу и идёт параллельно: пока клиент «печатает», мы считаем
@@ -3360,15 +3384,36 @@ function sendReply(text,fromQuick,quickStage){
     if(llmReq){
       const r=await llmReq.catch(()=>null);
       const clean=llmClean(r&&r.text);
-      if(clean){txt=clean;src='llm';st.llmReplies=(st.llmReplies||0)+1;if(r.model)st.llmModel=r.model}
+      if(clean){
+        txt=clean;src='llm';st.llmReplies=(st.llmReplies||0)+1;if(r.model)st.llmModel=r.model;
+        /* Точный расход: usage присылает воркер, мы только суммируем.
+           Это ответ на вопрос «сколько съел звонок» — по цифрам, не на глаз. */
+        const u=r.usage||{};const tot=Number(u.total||u.total_tokens||0)||0;
+        st.llmTokens=(st.llmTokens||0)+tot;
+        st.llmTokensIn=(st.llmTokensIn||0)+(Number(u.input||u.prompt_tokens)||0);
+        st.llmTokensOut=(st.llmTokensOut||0)+(Number(u.output||u.completion_tokens)||0);
+        if(r.cached)st.llmCached=(st.llmCached||0)+1;
+      }
       else{st.llmFallbacks=(st.llmFallbacks||0)+1}
     }
+    /* Закрывающие реплики пишет сценарий: финал должен быть вежливым
+       и предсказуемым, модель тут не нужна. */
+    if(closing===1){txt=goodbye(c);src='script'}
+    if(closing===2){txt=closingPush(c);src='script'}
     st.turns.push({who:'cli',txt,src});st.clientChars+=txt.length;
+    if(closing){
+      const sid=S.session.id;
+      setTimeout(()=>{
+        if(!S.session||S.session.id!==sid)return;
+        toast('Клиент попрощался — звонок завершён','phone');
+        endCall('done');
+      },closing===2?2600:3600);
+    }
     speak(txt,st);
     render();
     setTimeout(()=>{if(S.session){S.session.clientTyping=false;render()}},Math.min(2600,700+txt.length*22));
   },620);
-  if(s.mood<=0){
+  if(s.mood<=0&&!s.farewellStep){
     s.failReason=buildFailReason();
     setTimeout(()=>{const st=S.session;if(!st)return;
       st.turns.push({who:'cli',txt:farewell(c)});
@@ -3381,6 +3426,30 @@ function farewell(c){
     'Критик компании':'Я так и знал. До свидания.','Экономист':'Разговор не имеет экономического смысла. Всего доброго.',
     'Технарь':'Это пустой разговор. Отключаюсь.'};
   return m[c.type]||'До свидания.';
+}
+/* Тёплое прощание: клиент закрывает разговор сам. Раньше прощание было только
+   у проваленного звонка («Больше не звоните») — из-за этого менеджеры ходили
+   по кругу на последнем этапе. Теперь у каждого типа своя, по характеру. */
+function goodbye(c){
+  const m={'Скептик':'Договорились. Жду цифры и проект договора — посмотрю внимательно. На этом всё, до связи.',
+    'Спешащий':'Хорошо, тогда жду. Всё, мне бежать — до связи.',
+    'Эмоционал':'Спасибо, мне стало спокойнее. Жду ваш расчёт. Хорошего дня!',
+    'Молчаливый':'Хорошо. Буду ждать. До свидания.',
+    'Критик компании':'Ладно, убедили. Присылайте — посмотрю. До свидания.',
+    'Экономист':'Принимается. Жду расчёт по объёмам, сравню с текущими. Всего доброго.',
+    'Технарь':'Принято. Шлите спецификацию — сверю с нашими допусками. До связи.'};
+  return m[c.type]||'Договорились. Жду от вас материалы. До свидания.';
+}
+/* Менеджер продолжает после прощания: одна вежливая реплика-возврат, и всё. */
+function closingPush(c){
+  const m={'Скептик':'Мы уже всё обсудили — жду материалы. Всего доброго.',
+    'Спешащий':'У меня всё, побежал. Жду расчёт, до связи!',
+    'Эмоционал':'Мы же договорились — я жду ваш расчёт. Хорошего дня!',
+    'Молчаливый':'(пауза) Мы договорились. До свидания.',
+    'Критик компании':'Мы закончили. Присылайте, посмотрю. До свидания.',
+    'Экономист':'Решение принято, дальше — расчёт. Всего доброго.',
+    'Технарь':'Итог ясен: жду спецификацию. До связи.'};
+  return m[c.type]||'Мы договорились — жду материалы. Всего доброго.';
 }
 function buildFailReason(){
   const s=S.session;
@@ -3460,7 +3529,7 @@ function beeps(){
 
    Проверка на разных пользователях: экран 09 «Статус готовности» → «Проверка
    микрофона и голоса» — показывает по каждому пункту, что поддерживает браузер. */
-let REC=null,micRecording=false,micBase='',micFinals='',micInterim='';
+let REC=null,micRecording=false,micBase='',micFinals='',micInterim='';   /* голосовой ввод: буфер диктовки */
 function sttSupport(){
   if(svcReady('stt'))return {ok:true,kind:'server'};
   if(typeof window==='undefined')return {ok:false,why:'нет окна браузера'};
@@ -3534,6 +3603,14 @@ function startDictation(){
 function micFlushInterim(){
   if(micInterim&&micInterim.trim())micFinals=(micFinals?micFinals+' ':'')+micInterim.trim();
   micInterim='';
+}
+/* Реплику отправили — слушаем с чистого листа. Распознавание при этом
+   продолжает работать (не надо заново нажимать микрофон), но накопленное
+   забываем: следующая фраза не должна приклеиваться к предыдущей. */
+function micReset(){
+  micBase='';micFinals='';micInterim='';
+  S.draft='';
+  const el=$('#say');if(el)el.value='';
 }
 function stopDictation(){
   micRecording=false;
@@ -4099,5 +4176,5 @@ render();
   });
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4d74e75b8fde7b9',t:'MTc5MjQ5MTc5OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4d7f976aec1db08',t:'MTc5MjQ5ODgwNA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
